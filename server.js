@@ -1,106 +1,88 @@
 const express = require('express');
 const cors = require('cors');
-const initSqlJs = require('sql.js');
-const fs = require('fs');
-const path = require('path');
+const { createClient } = require('@libsql/client');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Database file path
-const dbPath = path.join(__dirname, 'usernames.db');
-
+// Initialize Turso client
 let db;
+try {
+  db = createClient({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
+} catch (error) {
+  console.error('Failed to create database client:', error);
+}
 
-// Initialize database
+// Initialize database tables
 async function initDatabase() {
-  const SQL = await initSqlJs();
+  if (!db) return;
   
-  // Load existing database or create new one
-  if (fs.existsSync(dbPath)) {
-    const fileBuffer = fs.readFileSync(dbPath);
-    db = new SQL.Database(fileBuffer);
-    console.log('✅ Loaded existing database');
-  } else {
-    db = new SQL.Database();
-    console.log('✅ Created new database');
+  try {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS usernames (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        list_type TEXT NOT NULL CHECK(list_type IN ('following', 'followers')),
+        display_name TEXT,
+        notes TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(username, list_type)
+      )
+    `);
+    console.log('Database initialized');
+  } catch (error) {
+    console.error('Database init error:', error);
   }
-  
-  // Create tables if they don't exist
-  db.run(`
-    CREATE TABLE IF NOT EXISTS usernames (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT NOT NULL,
-      list_type TEXT NOT NULL CHECK(list_type IN ('following', 'followers')),
-      display_name TEXT,
-      notes TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(username, list_type)
-    )
-  `);
-  
-  db.run(`CREATE INDEX IF NOT EXISTS idx_list_type ON usernames(list_type)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_username ON usernames(username)`);
-  
-  saveDatabase();
 }
 
-// Save database to file
-function saveDatabase() {
-  const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(dbPath, buffer);
-}
+// Initialize on first request
+let dbInitialized = false;
 
-// Helper to run SELECT queries and return results as array of objects
-function queryAll(sql, params = []) {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  const results = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
+// Middleware to ensure DB is initialized
+app.use(async (req, res, next) => {
+  if (!dbInitialized) {
+    await initDatabase();
+    dbInitialized = true;
   }
-  stmt.free();
-  return results;
-}
-
-// Helper to run SELECT query and return single result
-function queryOne(sql, params = []) {
-  const results = queryAll(sql, params);
-  return results.length > 0 ? results[0] : null;
-}
-
-// Helper to run INSERT/UPDATE/DELETE
-function run(sql, params = []) {
-  db.run(sql, params);
-  saveDatabase();
-  return {
-    lastInsertRowid: db.exec("SELECT last_insert_rowid()")[0]?.values[0][0],
-    changes: db.getRowsModified()
-  };
-}
+  next();
+});
 
 // ============= API ROUTES =============
 
-// GET all usernames (optionally filter by list_type)
-app.get('/api/usernames', (req, res) => {
+// Root route
+app.get('/', (req, res) => {
+  res.json({ message: 'X Username Manager API', status: 'running' });
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// GET all usernames
+app.get('/api/usernames', async (req, res) => {
   try {
     const { list_type } = req.query;
     
-    let usernames;
+    let result;
     
     if (list_type && ['following', 'followers'].includes(list_type)) {
-      usernames = queryAll('SELECT * FROM usernames WHERE list_type = ? ORDER BY created_at DESC', [list_type]);
+      result = await db.execute({
+        sql: 'SELECT * FROM usernames WHERE list_type = ? ORDER BY created_at DESC',
+        args: [list_type]
+      });
     } else {
-      usernames = queryAll('SELECT * FROM usernames ORDER BY list_type, created_at DESC');
+      result = await db.execute('SELECT * FROM usernames ORDER BY list_type, created_at DESC');
     }
     
-    res.json({ success: true, data: usernames });
+    res.json({ success: true, data: result.rows });
   } catch (error) {
     console.error('Error fetching usernames:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch usernames' });
@@ -108,16 +90,19 @@ app.get('/api/usernames', (req, res) => {
 });
 
 // GET single username by ID
-app.get('/api/usernames/:id', (req, res) => {
+app.get('/api/usernames/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const username = queryOne('SELECT * FROM usernames WHERE id = ?', [id]);
+    const result = await db.execute({
+      sql: 'SELECT * FROM usernames WHERE id = ?',
+      args: [id]
+    });
     
-    if (!username) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'Username not found' });
     }
     
-    res.json({ success: true, data: username });
+    res.json({ success: true, data: result.rows[0] });
   } catch (error) {
     console.error('Error fetching username:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch username' });
@@ -125,11 +110,10 @@ app.get('/api/usernames/:id', (req, res) => {
 });
 
 // POST create new username
-app.post('/api/usernames', (req, res) => {
+app.post('/api/usernames', async (req, res) => {
   try {
     const { username, list_type, display_name, notes } = req.body;
     
-    // Validation
     if (!username || !list_type) {
       return res.status(400).json({ 
         success: false, 
@@ -144,7 +128,6 @@ app.post('/api/usernames', (req, res) => {
       });
     }
     
-    // Clean the username (remove @ if present)
     const cleanUsername = username.replace(/^@/, '').trim().toLowerCase();
     
     if (!cleanUsername) {
@@ -154,24 +137,30 @@ app.post('/api/usernames', (req, res) => {
       });
     }
     
-    // Check if username already exists in this list
-    const existing = queryOne('SELECT id FROM usernames WHERE username = ? AND list_type = ?', [cleanUsername, list_type]);
+    // Check if exists
+    const existing = await db.execute({
+      sql: 'SELECT id FROM usernames WHERE username = ? AND list_type = ?',
+      args: [cleanUsername, list_type]
+    });
     
-    if (existing) {
+    if (existing.rows.length > 0) {
       return res.status(409).json({ 
         success: false, 
         error: `Username @${cleanUsername} already exists in ${list_type} list` 
       });
     }
     
-    const result = run(
-      `INSERT INTO usernames (username, list_type, display_name, notes) VALUES (?, ?, ?, ?)`,
-      [cleanUsername, list_type, display_name || null, notes || null]
-    );
+    const result = await db.execute({
+      sql: 'INSERT INTO usernames (username, list_type, display_name, notes) VALUES (?, ?, ?, ?)',
+      args: [cleanUsername, list_type, display_name || null, notes || null]
+    });
     
-    const newUsername = queryOne('SELECT * FROM usernames WHERE id = ?', [result.lastInsertRowid]);
+    const newUsername = await db.execute({
+      sql: 'SELECT * FROM usernames WHERE id = ?',
+      args: [result.lastInsertRowid]
+    });
     
-    res.status(201).json({ success: true, data: newUsername });
+    res.status(201).json({ success: true, data: newUsername.rows[0] });
   } catch (error) {
     console.error('Error creating username:', error);
     res.status(500).json({ success: false, error: 'Failed to create username' });
@@ -179,41 +168,41 @@ app.post('/api/usernames', (req, res) => {
 });
 
 // PUT update username
-app.put('/api/usernames/:id', (req, res) => {
+app.put('/api/usernames/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const { username, list_type, display_name, notes } = req.body;
     
-    // Check if username exists
-    const existing = queryOne('SELECT * FROM usernames WHERE id = ?', [id]);
-    if (!existing) {
+    const existingResult = await db.execute({
+      sql: 'SELECT * FROM usernames WHERE id = ?',
+      args: [id]
+    });
+    
+    if (existingResult.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'Username not found' });
     }
     
+    const existing = existingResult.rows[0];
     const cleanUsername = username ? username.replace(/^@/, '').trim().toLowerCase() : existing.username;
     const newListType = list_type || existing.list_type;
     
-    if (list_type && !['following', 'followers'].includes(list_type)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'list_type must be either "following" or "followers"' 
-      });
-    }
-    
-    run(
-      `UPDATE usernames SET username = ?, list_type = ?, display_name = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-      [
+    await db.execute({
+      sql: 'UPDATE usernames SET username = ?, list_type = ?, display_name = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      args: [
         cleanUsername,
         newListType,
         display_name !== undefined ? display_name : existing.display_name,
         notes !== undefined ? notes : existing.notes,
         id
       ]
-    );
+    });
     
-    const updated = queryOne('SELECT * FROM usernames WHERE id = ?', [id]);
+    const updated = await db.execute({
+      sql: 'SELECT * FROM usernames WHERE id = ?',
+      args: [id]
+    });
     
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data: updated.rows[0] });
   } catch (error) {
     console.error('Error updating username:', error);
     res.status(500).json({ success: false, error: 'Failed to update username' });
@@ -221,16 +210,23 @@ app.put('/api/usernames/:id', (req, res) => {
 });
 
 // DELETE username
-app.delete('/api/usernames/:id', (req, res) => {
+app.delete('/api/usernames/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
-    const existing = queryOne('SELECT * FROM usernames WHERE id = ?', [id]);
-    if (!existing) {
+    const existing = await db.execute({
+      sql: 'SELECT * FROM usernames WHERE id = ?',
+      args: [id]
+    });
+    
+    if (existing.rows.length === 0) {
       return res.status(404).json({ success: false, error: 'Username not found' });
     }
     
-    run('DELETE FROM usernames WHERE id = ?', [id]);
+    await db.execute({
+      sql: 'DELETE FROM usernames WHERE id = ?',
+      args: [id]
+    });
     
     res.json({ success: true, message: 'Username deleted successfully' });
   } catch (error) {
@@ -239,32 +235,8 @@ app.delete('/api/usernames/:id', (req, res) => {
   }
 });
 
-// DELETE all usernames in a list
-app.delete('/api/usernames/list/:list_type', (req, res) => {
-  try {
-    const { list_type } = req.params;
-    
-    if (!['following', 'followers'].includes(list_type)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'list_type must be either "following" or "followers"' 
-      });
-    }
-    
-    const result = run('DELETE FROM usernames WHERE list_type = ?', [list_type]);
-    
-    res.json({ 
-      success: true, 
-      message: `Deleted ${result.changes} usernames from ${list_type} list` 
-    });
-  } catch (error) {
-    console.error('Error deleting list:', error);
-    res.status(500).json({ success: false, error: 'Failed to delete list' });
-  }
-});
-
 // Bulk import usernames
-app.post('/api/usernames/bulk', (req, res) => {
+app.post('/api/usernames/bulk', async (req, res) => {
   try {
     const { usernames, list_type } = req.body;
     
@@ -283,21 +255,21 @@ app.post('/api/usernames/bulk', (req, res) => {
     }
     
     let inserted = 0;
+    
     for (const user of usernames) {
-      const cleanUsername = user.replace(/^@/, '').trim().toLowerCase();
+      const cleanUsername = String(user).replace(/^@/, '').trim().toLowerCase();
       if (cleanUsername) {
         try {
-          db.run(
-            `INSERT OR IGNORE INTO usernames (username, list_type) VALUES (?, ?)`,
-            [cleanUsername, list_type]
-          );
-          if (db.getRowsModified() > 0) inserted++;
+          await db.execute({
+            sql: 'INSERT OR IGNORE INTO usernames (username, list_type) VALUES (?, ?)',
+            args: [cleanUsername, list_type]
+          });
+          inserted++;
         } catch (e) {
           // Skip duplicates
         }
       }
     }
-    saveDatabase();
     
     res.status(201).json({ 
       success: true, 
@@ -312,7 +284,7 @@ app.post('/api/usernames/bulk', (req, res) => {
 });
 
 // Search usernames
-app.get('/api/search', (req, res) => {
+app.get('/api/search', async (req, res) => {
   try {
     const { q, list_type } = req.query;
     
@@ -320,27 +292,27 @@ app.get('/api/search', (req, res) => {
       return res.status(400).json({ success: false, error: 'Search query is required' });
     }
     
-    let results;
     const searchTerm = `%${q}%`;
+    let result;
     
     if (list_type && ['following', 'followers'].includes(list_type)) {
-      results = queryAll(
-        `SELECT * FROM usernames 
-         WHERE (username LIKE ? OR display_name LIKE ? OR notes LIKE ?)
-         AND list_type = ?
-         ORDER BY created_at DESC`,
-        [searchTerm, searchTerm, searchTerm, list_type]
-      );
+      result = await db.execute({
+        sql: `SELECT * FROM usernames 
+              WHERE (username LIKE ? OR display_name LIKE ? OR notes LIKE ?)
+              AND list_type = ?
+              ORDER BY created_at DESC`,
+        args: [searchTerm, searchTerm, searchTerm, list_type]
+      });
     } else {
-      results = queryAll(
-        `SELECT * FROM usernames 
-         WHERE username LIKE ? OR display_name LIKE ? OR notes LIKE ?
-         ORDER BY list_type, created_at DESC`,
-        [searchTerm, searchTerm, searchTerm]
-      );
+      result = await db.execute({
+        sql: `SELECT * FROM usernames 
+              WHERE username LIKE ? OR display_name LIKE ? OR notes LIKE ?
+              ORDER BY list_type, created_at DESC`,
+        args: [searchTerm, searchTerm, searchTerm]
+      });
     }
     
-    res.json({ success: true, data: results });
+    res.json({ success: true, data: result.rows });
   } catch (error) {
     console.error('Error searching:', error);
     res.status(500).json({ success: false, error: 'Failed to search usernames' });
@@ -348,17 +320,26 @@ app.get('/api/search', (req, res) => {
 });
 
 // Get stats
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', async (req, res) => {
   try {
-    const followingCount = queryOne('SELECT COUNT(*) as count FROM usernames WHERE list_type = ?', ['following']);
-    const followersCount = queryOne('SELECT COUNT(*) as count FROM usernames WHERE list_type = ?', ['followers']);
+    const followingResult = await db.execute({
+      sql: 'SELECT COUNT(*) as count FROM usernames WHERE list_type = ?',
+      args: ['following']
+    });
+    const followersResult = await db.execute({
+      sql: 'SELECT COUNT(*) as count FROM usernames WHERE list_type = ?',
+      args: ['followers']
+    });
+    
+    const following = Number(followingResult.rows[0]?.count || 0);
+    const followers = Number(followersResult.rows[0]?.count || 0);
     
     res.json({
       success: true,
       data: {
-        following: followingCount?.count || 0,
-        followers: followersCount?.count || 0,
-        total: (followingCount?.count || 0) + (followersCount?.count || 0)
+        following,
+        followers,
+        total: following + followers
       }
     });
   } catch (error) {
@@ -367,36 +348,13 @@ app.get('/api/stats', (req, res) => {
   }
 });
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// Start server after database is initialized
-initDatabase().then(() => {
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+  const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
-    console.log(`
-  ╔═══════════════════════════════════════════════════╗
-  ║                                                   ║
-  ║   🐦 X Username Manager API                       ║
-  ║                                                   ║
-  ║   Server running on http://localhost:${PORT}         ║
-  ║   Database: ${dbPath}
-  ║                                                   ║
-  ╚═══════════════════════════════════════════════════╝
-    `);
+    console.log(`Server running on http://localhost:${PORT}`);
   });
-}).catch(err => {
-  console.error('Failed to initialize database:', err);
-  process.exit(1);
-});
+}
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n🔴 Shutting down gracefully...');
-  if (db) {
-    saveDatabase();
-    db.close();
-  }
-  process.exit(0);
-});
+// Export for Vercel
+module.exports = app;
